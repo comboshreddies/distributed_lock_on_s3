@@ -29,7 +29,7 @@
 
 - **Multi-Phase Lock Example**
  
-  ./lock_on_s3.sh ./lock_on_s3.conf "./lock_on_s3.sh ./lock_on_s3.conf sample 2" sample 1
+  ./lock_on_s3.sh ./lock_on_s3.conf "./lock_on_s3.sh ./lock_on_s3.conf ./deploy.sh sample 2" sample 1
 
   - Phase 1 acquires the outer `sample-1` lock, then runs a second lock protected by suffix `sample-2`.  
   - Useful when orchestrating sequential steps that must not overlap (e.g., environment bootstrap followed by migration).
