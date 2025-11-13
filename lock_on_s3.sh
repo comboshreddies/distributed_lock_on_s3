@@ -483,7 +483,7 @@ if ! [[ "${LOCK_STALE_SEC}" =~ ^[0-9]+$ ]] || [ "${LOCK_STALE_SEC}" -lt 1 ]; the
     echo "$(ts) : error: LOCK_STALE_SEC must be a positive integer"
     exit 12
 fi
-if ! [[ "${EXP_BACKOFF_COEF}" =~ ^[0-9.]+$ ]] ; then
+if ! [[ "${EXP_BACKOFF_COEF}" =~ ^[1-9][0-9]*.[0-9]*$ ]] ; then
     echo "$(ts) : error: EXP_BACKOFF_COEF must be correct "
     exit 13
 fi
@@ -546,10 +546,15 @@ MAIN_START_TIME_NANO=$(date -u +%s%N)
 if [ "${PROTECTED_CMD}" != "unlock" ]; then
     echo "$(ts) : main : starting ${MAIN_START_TIME} ${MAIN_START_TIME_NANO}, pid $$, trying to get lock : "
     get_lock
+    GETLOCK_RC=$?
+    if [ "${GETLOCK_RC}" != "0" ] ; then
+        echo "$(ts) : main : get_lock exited with ${GETLOCK_RC}" code, exiting"
+        exit 17
+    fi
 else
     echo "$(ts) : main : starting, pid $$, trying to remove lock : "
     remove_lock
-    exit 17
+    exit 0
 fi
 
 ETAG_OUTPUT=$(jq -r '.ETag // "error"' ${TMP_DIR}/putobj.$$.json 2>/dev/null | tr -d '"' || echo "error")
