@@ -62,7 +62,7 @@ function check_wait_queue() {
     AWS_LIST_OBJ_EC=$?
     if [ "${AWS_LIST_OBJ_EC}" != "0" ] ; then
         echo "$(ts) : wait_queue_check : list objects failed, will retry"
-        return 0 
+        return 0
     fi
     WL_COUNT=$(jq '((.Contents // []) | length)'  ${TMP_DIR}/wait_list.$$.json)
     if [ "${WL_COUNT}" -eq 0 ] ;then
@@ -161,7 +161,7 @@ function delete_stale_lock() {
     if [ "${ETAG}" == "error" ] || [ -z "${ETAG}" ]; then
         echo "$(ts) : get_lock : error extracting ETag, retrying"
         adjusted_sleep
-        return 0 
+        return 0
     fi
     aws s3api delete-object --bucket "${BUCKET}" --key "${S3_LOCK_PATH}${LOCK_SUFFIX}" --if-match "${ETAG}" > ${TMP_DIR}/do.$$.json 2> ${TMP_DIR}/do.$$.error
     DELETEOBJ_ERROR_CODE=$?
@@ -174,7 +174,7 @@ function delete_stale_lock() {
         DELETEOBJ_HTTP_CODE=$(echo "${DELETEOBJ_ERROR}" | sed 's/.*(\([0-9]*\)).*/\1/g' 2>/dev/null || echo "0")
         if [ "${DELETEOBJ_HTTP_CODE}" == "404" ]; then
             echo "$(ts) : get_lock : stale lock already deleted by another process, retrying"
-        else 
+        else
             if [ "${DELETEOBJ_ERROR_CODE}" -ne 0 ] || [ "${DELETEOBJ_ERROR}" ] ; then
                 echo "$(ts) : get_lock : error deleting lock file, error code ${DELETEOBJ_ERROR_CODE}"
                 echo "$(ts) : get_lock : ${DELETEOBJ_ERROR}"
@@ -227,8 +227,8 @@ function get_lock() {
         echo "$(ts) : get_lock : remote lock file heads fetched"
         H_LAST_MOD=$(jq -r '.LastModified // "error"' ${TMP_DIR}/headobj.$$.json)
         if [ "${H_LAST_MOD}" == "error" ] || [ -z "${H_LAST_MOD}" ]; then
-            LAST_MOD="${H_LAST_MOD}"            
-            echo "$(ts) : get_lock : error fetching last modification time on head object, retry" 
+            LAST_MOD="${H_LAST_MOD}"
+            echo "$(ts) : get_lock : error fetching last modification time on head object, retry"
             adjusted_sleep
             continue
         fi
@@ -242,7 +242,7 @@ function get_lock() {
             if [ "${PREV_LAST_MOD}" != "${H_LAST_MOD}" ] ; then
                 RELATIVE_LAST_MOD_SEC_TS=$(date -u --iso-8601=seconds +%s)
                 PREV_LAST_MOD="${H_LAST_MOD}"
-                echo "$(ts) : get_lock : last modification changed, retry" 
+                echo "$(ts) : get_lock : last modification changed, retry"
                 adjusted_sleep
                 continue
             fi

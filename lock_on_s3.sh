@@ -61,7 +61,7 @@ function check_wait_queue() {
     AWS_LIST_OBJ_EC=$?
     if [ "${AWS_LIST_OBJ_EC}" != "0" ] ; then
         echo "$(ts) : wait_queue_check : list objects failed, will retry"
-        return 0 
+        return 0
     fi
     WL_COUNT=$(jq '((.Contents // []) | length)'  ${TMP_DIR}/wait_list.$$.json)
     if [ "${WL_COUNT}" -eq 0 ] ;then
