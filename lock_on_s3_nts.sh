@@ -11,11 +11,12 @@ set -Euo pipefail
 #  LOCK_STALE_SEC=300
 #  LOCK_LOOP_SLEEP_SEC=30
 #  LOCK_VERIFY_DELAY_SEC=3
-#  KEEPALIVE_LOOP_SLEEP_SEC=60
+#  KEEPALIVE_LOOP_SLEEP_SEC=20
 #  MAX_RETRIES=60
 #  GRACEFUL_SHUTDOWN_TIMEOUT_SEC=10
 #  EXP_BACKOFF_COEF=1.01
 #  WAIT_STALE_TIME_SEC=300
+#  CLIENTS_TIME_IN_SYNC=1
 
 function ts {
     echo "$(date -u --iso-8601=seconds) : $$ : ${TASK_NAME} : ${LOCK_SUFFIX}"
@@ -92,9 +93,106 @@ function check_wait_queue() {
     return 0
 }
 
+function append_us_to_wait() {
+    echo "$(ts) : append_to_wait : leaving trace of waiting"
+    echo "${MAIN_START_TIME_NANO} $$ ${MAIN_START_TIME} $(hostname) $(ts)" > ${TMP_DIR}/rputobj.$$.file
+    aws s3api put-object --bucket "${BUCKET}" --key "${S3_WAIT_PATH}${LOCK_SUFFIX}_$$_${TASK_NAME}" --metadata "{ \"ts\" : \"$(date -u +%s)\", \"pid\" : \"$$\"}" --content-type "text/plain" --body ${TMP_DIR}/rputobj.$$.file > ${TMP_DIR}/rputobj.$$.json 2>/dev/null || true
+    echo "$(ts) : get_lock : checking wait queue"
+    if [ "${WAIT_STALE_TIME_SEC}" != "0" ] ; then
+        check_wait_queue
+        CWQ_RC=$?
+        echo $CWQ_RC
+        if [ $CWQ_RC -ne 0 ] ; then
+            echo "$(ts) : get_lock : wait queue failed ${CWQ_RC}, exiting"
+            exit 44
+        fi
+    fi
+}
+
+function adjusted_sleep() {
+    ADJUSTED_SLEEP=$(echo "${LOCK_LOOP_SLEEP_SEC}*(${EXP_BACKOFF_COEF}^${RETRY_COUNT})"|bc)
+    echo "$(ts) : get_lock : sleep for ${ADJUSTED_SLEEP} and then retry"
+    sleep "${ADJUSTED_SLEEP}"
+}
+
+function put_object_lock() {
+    aws s3api put-object --bucket "${BUCKET}" --key "${S3_LOCK_PATH}${LOCK_SUFFIX}" --if-none-match '*' --metadata "{ \"ts\" : \"$(date -u +%s)\", \"pid\" : \"$$\"}" --content-type "text/plain" --body ${TMP_DIR}/putobj_lock_file.$$ > ${TMP_DIR}/putobj.$$.json 2> ${TMP_DIR}/putobj.$$.error
+    PUTOBJ_ERROR_CODE=$?
+    if [ ! -f "${TMP_DIR}/putobj.$$.error" ]; then
+        echo "$(ts) : get_lock : error: expected error file not found"
+        exit 42
+    fi
+    PUTOBJ_ERROR=$(cat ${TMP_DIR}/putobj.$$.error | grep -v ^$ || true)
+    if [ "${PUTOBJ_ERROR_CODE}" -ne 0 ] || [ "${PUTOBJ_ERROR}" ] ; then
+        # put object failed, sleep and continue
+        echo "$(ts) : get_lock : error obtaining lock, leaving trace of waiting"
+        echo -n "$(ts) : get_lock : "
+        cat ${TMP_DIR}/putobj.$$.error | grep -v ^$
+        echo "$(ts) : get_lock : retry in ${LOCK_LOOP_SLEEP_SEC}"
+        continue
+    else
+        # put object was successful, lock is on, notify and break
+        echo "$(ts) : get_lock : check if lock is stabile, sleep for ${LOCK_VERIFY_DELAY_SEC} and verify"
+        sleep "${LOCK_VERIFY_DELAY_SEC}"
+        aws s3api head-object --bucket "${BUCKET}" --key "${S3_LOCK_PATH}${LOCK_SUFFIX}" --output json > ${TMP_DIR}/verify.$$.json 2> ${TMP_DIR}/verify.$$.error
+        VERIFY_HEAD_ERROR_CODE=$?
+        if [ "${VERIFY_HEAD_ERROR_CODE}" -ne 0 ]; then
+            echo "$(ts) : get_lock : error verifying lock ownership, retrying"
+            continue
+        fi
+        ETAG_OUTPUT=$(jq -r '.ETag // "error1"' ${TMP_DIR}/putobj.$$.json 2>/dev/null | tr -d '"' || echo "error1")
+        VERIFY_ETAG=$(jq -r '.ETag // "error2"' ${TMP_DIR}/verify.$$.json 2>/dev/null | tr -d '"' || echo "error2")
+        if [ "${VERIFY_ETAG}" == "error2" ] || [ "${ETAG_OUTPUT}" == "error1" ] || [ -z "${VERIFY_ETAG}" ] || [ -z "${ETAG_OUTPUT}" ] ; then
+            echo "$(ts) : get_lock : lock verification failed (ETag extraction error), retrying"
+            continue
+        fi
+set +x
+        echo "$(ts) : get_lock : adding informative lock achieved file ${S3_LOCK_ACHIEVED_PATH}${LOCK_SUFFIX}_$$_${TASK_NAME}"
+        cp ${TMP_DIR}/putobj_lock_file.$$ ${TMP_DIR}/putobj_lock_file.$$.lock_taken
+        echo "$(ts) $$ ${TASK_NAME} ${PROTECTED_CMD}" > ${TMP_DIR}/lock_achieved.$$.file
+aws s3api put-object --bucket "${BUCKET}" --key "${S3_LOCK_ACHIEVED_PATH}${LOCK_SUFFIX}_$$_${TASK_NAME}" --metadata "{ \"ts\" : \"$(date -u +%s)\", \"pid\" : \"$$\", \"hostname\" : \"$(hostname)\" }" --content-type "text/plain" --body ${TMP_DIR}/lock_achieved.$$.file > ${TMP_DIR}/lock_achieved.$$.json 2>/dev/null || true
+        aws s3api delete-object --bucket "${BUCKET}" --key "${S3_WAIT_PATH}${LOCK_SUFFIX}_$$_${TASK_NAME}" > ${TMP_DIR}/wdelobj.$$.json 2>/dev/null || true
+        break
+    fi
+}
+
+function delete_stale_lock() {
+    ETAG=$( jq -r '.ETag // "error"' ${TMP_DIR}/headobj.$$.json | tr -d '"' )
+    if [ "${ETAG}" == "error" ] || [ -z "${ETAG}" ]; then
+        echo "$(ts) : get_lock : error extracting ETag, retrying"
+        adjusted_sleep
+        return 0 
+    fi
+    aws s3api delete-object --bucket "${BUCKET}" --key "${S3_LOCK_PATH}${LOCK_SUFFIX}" --if-match "${ETAG}" > ${TMP_DIR}/do.$$.json 2> ${TMP_DIR}/do.$$.error
+    DELETEOBJ_ERROR_CODE=$?
+    if [ "${DELETEOBJ_ERROR_CODE}" -ne 0 ] ; then
+        if [ ! -f "${TMP_DIR}/do.$$.error" ]; then
+            echo "$(ts) : get_lock : error: expected error file (for deletion) not found"
+            exit 45
+        fi
+        DELETEOBJ_ERROR=$(cat ${TMP_DIR}/do.$$.error | grep -v ^$ || true)
+        DELETEOBJ_HTTP_CODE=$(echo "${DELETEOBJ_ERROR}" | sed 's/.*(\([0-9]*\)).*/\1/g' 2>/dev/null || echo "0")
+        if [ "${DELETEOBJ_HTTP_CODE}" == "404" ]; then
+            echo "$(ts) : get_lock : stale lock already deleted by another process, retrying"
+        else 
+            if [ "${DELETEOBJ_ERROR_CODE}" -ne 0 ] || [ "${DELETEOBJ_ERROR}" ] ; then
+                echo "$(ts) : get_lock : error deleting lock file, error code ${DELETEOBJ_ERROR_CODE}"
+                echo "$(ts) : get_lock : ${DELETEOBJ_ERROR}"
+                echo -n "$(ts) : get_lock : "
+                cat ${TMP_DIR}/do.$$.error | grep -v ^$
+            fi
+        fi
+        adjusted_sleep
+    else
+        echo "$(ts) : get_lock : lockfile removing complete"
+    fi
+    return 0
+}
+
 function get_lock() {
     RETRY_COUNT=0
     LOCK_WAIT_START=$(date -u +%s)
+    PREV_LAST_MOD=""
     while true ; do
         RETRY_COUNT=$((RETRY_COUNT + 1))
         if [ "${RETRY_COUNT}" -gt "${MAX_RETRIES}" ] ; then
@@ -117,44 +215,7 @@ function get_lock() {
             if [ "${HEADOBJ_HTTP_CODE}" == "404" ] && [ "${HEADOBJ_REASON}" == " Not Found" ] ; then
                 echo "$(ts) : get_lock : lock file not found, trying to lock"
                 echo "$(ts) $$" > ${TMP_DIR}/putobj_lock_file.$$
-                aws s3api put-object --bucket "${BUCKET}" --key "${S3_LOCK_PATH}${LOCK_SUFFIX}" --if-none-match '*' --metadata "{ \"ts\" : \"$(date -u +%s)\", \"pid\" : \"$$\"}" --content-type "text/plain" --body ${TMP_DIR}/putobj_lock_file.$$ > ${TMP_DIR}/putobj.$$.json 2> ${TMP_DIR}/putobj.$$.error
-                PUTOBJ_ERROR_CODE=$?
-                if [ ! -f "${TMP_DIR}/putobj.$$.error" ]; then
-                    echo "$(ts) : get_lock : error: expected error file not found"
-                    exit 42
-                fi
-                PUTOBJ_ERROR=$(cat ${TMP_DIR}/putobj.$$.error | grep -v ^$ || true)
-                if [ "${PUTOBJ_ERROR_CODE}" -ne 0 ] || [ "${PUTOBJ_ERROR}" ] ; then
-                    # put object failed, sleep and continue
-                    echo "$(ts) : get_lock : error obtaining lock, leaving trace of waiting"
-                    echo -n "$(ts) : get_lock : "
-                    cat ${TMP_DIR}/putobj.$$.error | grep -v ^$
-                    echo "$(ts) : get_lock : retry in ${LOCK_LOOP_SLEEP_SEC}"
-                    continue
-                else
-                    # put object was successful, lock is on, notify and break
-                    echo "$(ts) : get_lock : check if lock is stabile, sleep for ${LOCK_VERIFY_DELAY_SEC} and verify"
-                    sleep "${LOCK_VERIFY_DELAY_SEC}"
-                    aws s3api head-object --bucket "${BUCKET}" --key "${S3_LOCK_PATH}${LOCK_SUFFIX}" --output json > ${TMP_DIR}/verify.$$.json 2> ${TMP_DIR}/verify.$$.error
-                    VERIFY_HEAD_ERROR_CODE=$?
-                    if [ "${VERIFY_HEAD_ERROR_CODE}" -ne 0 ]; then
-                        echo "$(ts) : get_lock : error verifying lock ownership, retrying"
-                        continue
-                    fi
-                    ETAG_OUTPUT=$(jq -r '.ETag // "error1"' ${TMP_DIR}/putobj.$$.json 2>/dev/null | tr -d '"' || echo "error1")
-                    VERIFY_ETAG=$(jq -r '.ETag // "error2"' ${TMP_DIR}/verify.$$.json 2>/dev/null | tr -d '"' || echo "error2")
-                    if [ "${VERIFY_ETAG}" == "error2" ] || [ "${ETAG_OUTPUT}" == "error1" ] || [ -z "${VERIFY_ETAG}" ] || [ -z "${ETAG_OUTPUT}" ] ; then
-                        echo "$(ts) : get_lock : lock verification failed (ETag extraction error), retrying"
-                        continue
-                    fi
-            set +x
-                    echo "$(ts) : get_lock : adding informative lock achieved file ${S3_LOCK_ACHIEVED_PATH}${LOCK_SUFFIX}_$$_${TASK_NAME}"
-                    cp ${TMP_DIR}/putobj_lock_file.$$ ${TMP_DIR}/putobj_lock_file.$$.lock_taken
-                    echo "$(ts) $$ ${TASK_NAME} ${PROTECTED_CMD}" > ${TMP_DIR}/lock_achieved.$$.file
-            aws s3api put-object --bucket "${BUCKET}" --key "${S3_LOCK_ACHIEVED_PATH}${LOCK_SUFFIX}_$$_${TASK_NAME}" --metadata "{ \"ts\" : \"$(date -u +%s)\", \"pid\" : \"$$\", \"hostname\" : \"$(hostname)\" }" --content-type "text/plain" --body ${TMP_DIR}/lock_achieved.$$.file > ${TMP_DIR}/lock_achieved.$$.json 2>/dev/null || true
-                    aws s3api delete-object --bucket "${BUCKET}" --key "${S3_WAIT_PATH}${LOCK_SUFFIX}_$$_${TASK_NAME}" > ${TMP_DIR}/wdelobj.$$.json 2>/dev/null || true
-                    break
-                fi
+                put_object_lock
             else
                 echo "$(ts) : get_lock : unhandled error, exiting"
                 echo "$(ts) : get_lock : error code: ${HEADOBJ_ERROR_CODE}"
@@ -163,16 +224,30 @@ function get_lock() {
             fi
         fi
 
-        unset PUTOBJ_ERROR_CODE PUTOBJ_ERROR HEADOBJ_ERROR_CODE HEADOBJ_ERROR
-
         echo "$(ts) : get_lock : remote lock file heads fetched"
-        STALE_TIME=$(date -u --iso-8601=seconds -d "${LOCK_STALE_SEC} seconds ago")
-        LAST_MOD=$(jq -r '.LastModified // "error"' ${TMP_DIR}/headobj.$$.json)
-        if [ "${LAST_MOD}" == "error" ] || [ -z "${LAST_MOD}" ]; then
-            ADJUSTED_SLEEP=$(echo "${LOCK_LOOP_SLEEP_SEC}*(${EXP_BACKOFF_COEF}^${RETRY_COUNT})"|bc)
-            echo "$(ts) : get_lock : error extracting LastModified, retrying - sleep ${ADJUSTED_SLEEP} sec)"
-            sleep "${ADJUSTED_SLEEP}"
+        H_LAST_MOD=$(jq -r '.LastModified // "error"' ${TMP_DIR}/headobj.$$.json)
+        if [ "${H_LAST_MOD}" == "error" ] || [ -z "${H_LAST_MOD}" ]; then
+            LAST_MOD="${H_LAST_MOD}"            
+            echo "$(ts) : get_lock : error fetching last modification time on head object, retry" 
+            adjusted_sleep
             continue
+        fi
+        if [ "${CLIENTS_TIME_IN_SYNC}" -gt 0 ] ; then
+            # relying on synced clients and current time
+            STALE_TIME=$(date -u --iso-8601=seconds -d "${LOCK_STALE_SEC} seconds ago")
+            LAST_MOD="${H_LAST_MOD}"
+        else
+            # relying on relative time difference, clients might run out of sync
+            # it should be a cycle or two slower
+            if [ "${PREV_LAST_MOD}" != "${H_LAST_MOD}" ] ; then
+                RELATIVE_LAST_MOD_SEC_TS=$(date -u --iso-8601=seconds +%s)
+                PREV_LAST_MOD="${H_LAST_MOD}"
+                echo "$(ts) : get_lock : last modification changed, retry" 
+                adjusted_sleep
+                continue
+            fi
+            LAST_MOD="${RELATIVE_LAST_MOD_SEC_TS}"
+            STALE_TIME=$(date -u + --iso-8601=seconds -d "${LOCK_STALE_SEC} seconds ago")
         fi
         if [[ "${LAST_MOD}" > "${STALE_TIME}" ]]; then
             echo "$(ts) : get_lock : found, not stale, _____ LAST_MOD ${LAST_MOD}"
@@ -181,58 +256,12 @@ function get_lock() {
             jq -r '"lm: \(.LastModified) et: \(.ETag) "' ${TMP_DIR}/headobj.$$.json
             echo -n "$(ts) : get_lock : "
             jq -r '"Metadata: ts: \(.Metadata.ts) pid: \(.Metadata.pid)"' ${TMP_DIR}/headobj.$$.json
-            ADJUSTED_SLEEP=$(echo "${LOCK_LOOP_SLEEP_SEC}*(${EXP_BACKOFF_COEF}^${RETRY_COUNT})"|bc)
-            echo "$(ts) : get_lock : leaving trace of waiting"
-            echo "${MAIN_START_TIME_NANO} $$ ${MAIN_START_TIME} $(hostname) $(ts)" > ${TMP_DIR}/rputobj.$$.file
-            aws s3api put-object --bucket "${BUCKET}" --key "${S3_WAIT_PATH}${LOCK_SUFFIX}_$$_${TASK_NAME}" --metadata "{ \"ts\" : \"$(date -u +%s)\", \"pid\" : \"$$\"}" --content-type "text/plain" --body ${TMP_DIR}/rputobj.$$.file > ${TMP_DIR}/rputobj.$$.json 2>/dev/null || true
-            echo "$(ts) : get_lock : checking wait queue"
-            if [ "${WAIT_STALE_TIME_SEC}" != "0" ] ; then
-                check_wait_queue
-                CWQ_RC=$?
-                echo $CWQ_RC
-                if [ $CWQ_RC -ne 0 ] ; then
-                    echo "$(ts) : get_lock : wait queue failed ${CWQ_RC}, exiting"
-                    exit 44
-                fi
-            fi
-            echo "$(ts) : get_lock : sleeping for ${ADJUSTED_SLEEP} seconds, then retry (leaving trace of waiting)"
-            sleep "${ADJUSTED_SLEEP}"
+            append_us_to_wait
+            adjusted_sleep
             continue
         else
             echo "$(ts) : get_lock : found, it is stale, LAST_MOD ${LAST_MOD} STALE_TIME ${STALE_TIME}"
-            ETAG=$( jq -r '.ETag // "error"' ${TMP_DIR}/headobj.$$.json | tr -d '"' )
-            if [ "${ETAG}" == "error" ] || [ -z "${ETAG}" ]; then
-                echo "$(ts) : get_lock : error extracting ETag, retrying"
-                ADJUSTED_SLEEP=$(echo "${LOCK_LOOP_SLEEP_SEC}*(${EXP_BACKOFF_COEF}^${RETRY_COUNT})"|bc)
-                sleep "${ADJUSTED_SLEEP}"
-                continue
-            fi
-            aws s3api delete-object --bucket "${BUCKET}" --key "${S3_LOCK_PATH}${LOCK_SUFFIX}" --if-match "${ETAG}" > ${TMP_DIR}/do.$$.json 2> ${TMP_DIR}/do.$$.error
-            DELETEOBJ_ERROR_CODE=$?
-            if [ "${DELETEOBJ_ERROR_CODE}" -ne 0 ] ; then
-                if [ ! -f "${TMP_DIR}/do.$$.error" ]; then
-                    echo "$(ts) : get_lock : error: expected error file (for deletion) not found"
-                    exit 45
-                fi
-                DELETEOBJ_ERROR=$(cat ${TMP_DIR}/do.$$.error | grep -v ^$ || true)
-                DELETEOBJ_HTTP_CODE=$(echo "${DELETEOBJ_ERROR}" | sed 's/.*(\([0-9]*\)).*/\1/g' 2>/dev/null || echo "0")
-                if [ "${DELETEOBJ_HTTP_CODE}" == "404" ]; then
-                    echo "$(ts) : get_lock : stale lock already deleted by another process, retrying"
-                    continue  # Lock already gone, retry acquisition
-                fi
-                if [ "${DELETEOBJ_ERROR_CODE}" -ne 0 ] || [ "${DELETEOBJ_ERROR}" ] ; then
-                    echo "$(ts) : get_lock : error deleting lock file, error code ${DELETEOBJ_ERROR_CODE}"
-                    echo "$(ts) : get_lock : ${DELETEOBJ_ERROR}"
-                    echo -n "$(ts) : get_lock : "
-                    cat ${TMP_DIR}/do.$$.error | grep -v ^$
-                    ADJUSTED_SLEEP=$(echo "${LOCK_LOOP_SLEEP_SEC}*(${EXP_BACKOFF_COEF}^${RETRY_COUNT})"|bc)
-                    echo "$(ts) : get_lock : sleep for ${ADJUSTED_SLEEP} and then retry"
-                    sleep "${ADJUSTED_SLEEP}"
-                fi
-            else
-                echo "$(ts) : get_lock : lockfile removing complete"
-            fi
-            unset DELETEOBJ_ERROR_CODE DELETEOBJ_ERROR DELETEOBJ_HTTP_CODE
+            delete_stale_lock
         fi
         unset STALE_TIME LAST_MOD
     done
@@ -474,29 +503,38 @@ if ! [[ "${KEEPALIVE_LOOP_SLEEP_SEC}" =~ ^[0-9]+$ ]] || [ "${KEEPALIVE_LOOP_SLEE
     echo "$(ts) : error: KEEPALIVE_LOOP_SLEEP_SEC must be a positive integer"
     exit 10
 fi
+if [[ "$((KEEPALIVE_LOOP_SLEEP_SEC*2))" -lt "${LOCK_LOOP_SLEEP_SEC}" ]; then
+    echo "$(ts) : error: 2 * KEEPALIVE_LOOP_SLEEP_SEC must be less than LOCK_LOOP_SLEEP_SEC"
+    exit 11
+fi
 if ! [[ "${MAX_LOCK_DURATION_SEC}" =~ ^[0-9]+$ ]] || [ "${MAX_LOCK_DURATION_SEC}" -lt 1 ]; then
     echo "$(ts) : error: MAX_LOCK_DURATION_SEC must be a positive integer"
-    exit 11
+    exit 12
 fi
 if ! [[ "${LOCK_STALE_SEC}" =~ ^[0-9]+$ ]] || [ "${LOCK_STALE_SEC}" -lt 1 ]; then
     echo "$(ts) : error: LOCK_STALE_SEC must be a positive integer"
-    exit 12
+    exit 13
 fi
 if ! [[ "${EXP_BACKOFF_COEF}" =~ ^[1-9][0-9]*.[0-9]*$ ]] ; then
     echo "$(ts) : error: EXP_BACKOFF_COEF must be correct "
-    exit 13
+    exit 14
 fi
 if ! [[ "${WAIT_STALE_TIME_SEC}" =~ ^[0-9]+$ ]] || [ "${WAIT_STALE_TIME_SEC}" -lt 0 ]; then
     echo "$(ts) : error: WAIT_STALE_TIME_SEC must be a non-negative integer"
-    exit 14
+    exit 15
 fi
+if ! [[ "${CLIENTS_TIME_IN_SYNC}" =~ ^[0-9]+$ ]] || [ "${CLIENTS_TIME_IN_SYNC}" -lt 0 ]; then
+    echo "$(ts) : error: CLIENTS_TIME_IN_SYNC must be a non-negative integer"
+    exit 16
+fi
+
 if [[ -z "${PROTECTED_CMD}" ]]; then
     echo "$(ts) : error: command must not be empty"
-    exit 15
+    exit 17
 fi
 if [[ "${PROTECTED_CMD}" =~ [\;\&\|\(\)\<\>\$\`\"] ]]; then
     echo "$(ts) : error: forbidden characters in PROTECTED_CMD"
-    exit 16
+    exit 18
 fi
 
 
@@ -514,6 +552,7 @@ fi
 : "${GRACEFUL_SHUTDOWN_TIMEOUT_SEC:?GRACEFUL_SHUTDOWN_TIMEOUT_SEC must be set in conf file}"
 : "${EXP_BACKOFF_COEF:?EXP_BACKOFF_COEF must be set in conf file}"
 : "${WAIT_STALE_TIME_SEC:?WAIT_STALE_TIME_SEC must be set in conf file}"
+: "${CLIENTS_TIME_IN_SYNC:?CLIENTS_TIME_IN_SYNC must be set in conf file}"
 
 echo "$(ts) : main : BUCKET : ->${BUCKET}<-"
 echo "$(ts) : main : LOCK_PATH : ->${S3_LOCK_PATH}<-"
@@ -527,6 +566,8 @@ echo "$(ts) : main : KEEPALIVE_LOOP_SLEEP_SEC : ->${KEEPALIVE_LOOP_SLEEP_SEC}<-"
 echo "$(ts) : main : MAX_RETRIES : ->${MAX_RETRIES}<-"
 echo "$(ts) : main : GRACEFUL_SHUTDOWN_TIMEOUT_SEC : ->${GRACEFUL_SHUTDOWN_TIMEOUT_SEC}<-"
 echo "$(ts) : main : EXP_BACKOFF_COEF : ->${EXP_BACKOFF_COEF}<-"
+echo "$(ts) : main : WAIT_STALE_TIME_SEC : ->${WAIT_STALE_TIME_SEC}<-"
+echo "$(ts) : main : CLIENTS_TIME_IN_SYNC : ->${CLIENTS_TIME_IN_SYNC}<-"
 
 if [[ "${S3_LOCK_PATH}" =~ ^/ ]] || [[ "${S3_LOCK_PATH}" =~ /$ ]]; then
     echo "$(ts) : warning: S3_LOCK_PATH should not start or end with '/'"
@@ -548,7 +589,7 @@ if [ "${PROTECTED_CMD}" != "unlock" ]; then
     GETLOCK_RC=$?
     if [ "${GETLOCK_RC}" != "0" ] ; then
         echo "$(ts) : main : get_lock exited with ${GETLOCK_RC}" code, exiting"
-        exit 17
+        exit 19
     fi
 else
     echo "$(ts) : main : starting, pid $$, trying to remove lock : "

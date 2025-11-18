@@ -13,6 +13,7 @@
   - Paths: `BUCKET`, `S3_LOCK_PATH`, `S3_WAIT_PATH`, `S3_LOCK_ACHIEVED_PATH`
   - Timing: `LOCK_STALE_SEC`, `MAX_LOCK_DURATION_SEC`, `LOCK_LOOP_SLEEP_SEC`, `LOCK_VERIFY_DELAY_SEC`, `KEEPALIVE_LOOP_SLEEP_SEC`, `WAIT_STALE_TIME_SEC`
   - Retry: `MAX_RETRIES`, `EXP_BACKOFF_COEF`, `GRACEFUL_SHUTDOWN_TIMEOUT_SEC`
+  - Sync Clients: `CLIENTS_TIME_IN_SYNC`
 
 - **Requirements**
   - Bash 5.1+ (uses `wait -f -n -p`)
@@ -47,3 +48,5 @@
   - `60+`: keep-alive errors or intrusion detection  
   - `99`: terminated via signal (SIGINT/SIGTERM)
 
+- **Note**
+  - added for not time safe clients, lock_on_s3_nts.sh, once tested I will move it to lock_on_s3.sh
